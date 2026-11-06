@@ -1,5 +1,5 @@
 // A lazy file browser for the focused pane's folder, with bounded read-only previews
-// and a content search that streams ripgrep matches while it runs.
+// and a search by file name or by content that streams ripgrep results while it runs.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, v_virtual_list } from "gpui-base";
 import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window } from "herdr";
@@ -14,11 +14,28 @@ const key = () => JSON.stringify(location());
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
 const PER_FOLDER = 500, TOTAL = 5000;
 const MATCHES = 2000, POLL_MS = 120, CHUNK = 1 << 20, ROW = 24;
-// rg runs in the background and writes JSON lines to a temp file; the panel reads new lines while it runs.
-const START = 'command -v rg >/dev/null 2>&1 || { echo norg; exit 0; }; f=$(mktemp "${TMPDIR:-/tmp}/herdr-search.XXXXXX") || exit 1; rg --json --hidden --glob "!.git" --fixed-strings --smart-case --max-count 100 -- "$1" . > "$f" 2>/dev/null < /dev/null & echo "$! $f"';
+// rg runs in the background and writes its output to a temp file; the panel reads new lines while it runs.
+// Its own process group (set -m) and nohup: an exec on another machine ends its session's processes when it returns.
+const START = '{ set -m; } 2>/dev/null; command -v rg >/dev/null 2>&1 || { echo norg; exit 0; }; f=$(mktemp "${TMPDIR:-/tmp}/herdr-search.XXXXXX") || exit 1; nohup rg "$@" > "$f" 2>/dev/null < /dev/null & echo "$! $f"';
 // "done" first when rg has exited, then at most CHUNK bytes from byte offset $3: tail -c seeks instead of rescanning the file.
 const POLL = 'kill -0 "$2" 2>/dev/null || echo done; tail -c +"$3" "$1" | head -c "$4"';
 const STOP = 'kill "$2" 2>/dev/null; rm -f "$1"';
+
+const COMMON = ["--hidden", "--glob", "!.git", "--path-separator", "/"];
+const rgArgs = (mode, query) => mode === "name"
+  ? ["--files", ...COMMON, "."]
+  : ["--json", ...COMMON, "--fixed-strings", "--smart-case", "--max-count", "100", "--", query, "."];
+
+// File names match like the content search: case-insensitive unless the query has capitals.
+// A query with a slash matches the whole relative path, otherwise just the name.
+function nameMatcher(query) {
+  const q = query.replace(/\\/g, "/"), exact = q !== q.toLowerCase(), whole = q.includes("/");
+  const needle = exact ? q : q.toLowerCase();
+  return path => {
+    const s = whole ? path : path.slice(path.lastIndexOf("/") + 1);
+    return (exact ? s : s.toLowerCase()).includes(needle);
+  };
+}
 
 function utf8Length(text) {
   let n = 0;
@@ -69,7 +86,8 @@ export default class Files extends View {
   init(_props, cx) {
     this.saved = new Map();
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {}; this.hitRows = []; this.headers = new Map(); this.count = 0;
-    this.query = InputState.new({ placeholder: "Search in files" });
+    this.mode = "content";
+    this.query = InputState.new({ placeholder: "Search files" });
     this.query.on("change", (_e, cx) => { this.debounce?.cancel(); this.debounce = cx.timer.after(200, cx => this.search(cx)); });
     this.query.on("focus", (_e, cx) => { this.queryFocused = true; cx.notify(); });
     this.query.on("blur", (_e, cx) => { this.queryFocused = false; cx.notify(); });
@@ -195,16 +213,25 @@ export default class Files extends View {
     return out;
   }
 
+  setMode(mode, cx) {
+    if (this.mode === mode) return;
+    this.mode = mode;
+    this.search(cx);
+  }
+
   search(cx) {
     this.stop();
-    const query = this.query.value();
-    this.hitRows = []; this.headers = new Map(); this.count = 0; this.capped = false; this.searchError = null;
+    const query = this.query.value(), mode = this.mode;
+    this.hitRows = []; this.headers = new Map(); this.count = 0; this.capped = false; this.searchError = null; this.searchMode = mode;
     if (!query || !this.root) { cx.notify(); return; }
-    const run = { cwd: this.root, on: this.on, offset: 1 };
+    const windows = !this.on && window()?.platform === "windows";
+    const run = { cwd: this.root, on: this.on, offset: 1, windows, match: mode === "name" ? nameMatcher(query) : null };
+    const args = rgArgs(mode, query);
     this.run = run; this.searching = true;
     cx.spawn(async cx => {
       try {
-        const r = await exec("sh", ["-c", START, "search", query], { cwd: run.cwd, on: run.on });
+        if (windows) return await this.searchOnce(run, args);
+        const r = await exec("sh", ["-c", START, "search", ...args], { cwd: run.cwd, on: run.on });
         const out = r.stdout.trim();
         if (out === "norg") throw new Error("ripgrep (rg) is not installed on this machine");
         if (r.code !== 0 || !out) throw new Error(r.stderr.trim() || "Cannot start the search");
@@ -218,6 +245,21 @@ export default class Files extends View {
     });
   }
 
+  // Windows has no sh, and a background rg started from PowerShell inherits exec's output
+  // pipes, so exec would wait for it anyway: rg runs once, within exec's 30 s and 8 MiB.
+  async searchOnce(run, args) {
+    let r;
+    try { r = await exec("rg", args, { cwd: run.cwd }); }
+    catch (e) { throw String(e).includes("not found") ? new Error("ripgrep (rg) is not installed on this machine") : e; }
+    if (this.run !== run) return;
+    const lines = r.stdout.split("\n");
+    lines.pop(); // "" after the last newline, or a line cut at the output limit
+    for (const line of lines) this.add(line.replace(/\r$/, ""), run);
+    if (r.code === 2 && !this.count) throw new Error(r.stderr.trim().split("\n")[0] || "Cannot search this folder");
+    if (this.count >= MATCHES || r.stdout.length >= 8000000) this.capped = true;
+    this.run = null; this.searching = false;
+  }
+
   poll(run, cx) {
     if (run.busy || this.run !== run) return;
     run.busy = true;
@@ -228,7 +270,7 @@ export default class Files extends View {
         const done = r.stdout.startsWith("done\n"), body = done ? r.stdout.slice(5) : r.stdout;
         const lines = body.split("\n");
         const rest = lines.pop(); // "" after the last newline, or a line rg is still writing or the chunk cut
-        for (const line of lines) { run.offset += utf8Length(line) + 1; this.add(line); }
+        for (const line of lines) { run.offset += utf8Length(line) + 1; this.add(line, run); }
         const finished = done && !rest;
         if (this.count >= MATCHES && !finished) this.capped = true;
         if (finished || this.capped) this.stop();
@@ -239,13 +281,26 @@ export default class Files extends View {
     });
   }
 
-  add(line) {
+  // rg's JSON keeps Windows separators even with --path-separator.
+  relative(path, run) {
+    return (run.windows ? path.replace(/\\/g, "/") : path).replace(/^\.\//, "");
+  }
+
+  add(line, run) {
     if (this.count >= MATCHES) return;
+    if (run.match) {
+      const path = this.relative(line, run);
+      if (!path || !run.match(path)) return;
+      const slash = path.lastIndexOf("/");
+      this.hitRows.push({ path, name: path.slice(slash + 1), dir: path.slice(0, Math.max(slash, 0)) });
+      this.count++;
+      return;
+    }
     let event;
     try { event = JSON.parse(line); } catch { return; }
     const data = event.type === "match" ? event.data : null;
     if (data?.path.text == null || data.lines.text == null) return;
-    const path = data.path.text.replace(/^\.\//, ""), text = data.lines.text.replace(/\r?\n$/, ""), hit = data.submatches[0];
+    const path = this.relative(data.path.text, run), text = data.lines.text.replace(/\r?\n$/, ""), hit = data.submatches[0];
     const start = hit ? utf16(text, hit.start) : 0, end = hit ? utf16(text, hit.end) : 0;
     let lead = text.slice(0, start).trimStart();
     if (lead.length > 16) lead = "…" + lead.slice(-12);
@@ -279,11 +334,12 @@ export default class Files extends View {
   }
 
   hitRow(row, t, mono) {
-    if (row.n !== undefined) return h_flex().h(ROW).px(8).gap(7).items_center()
+    if (row.line === undefined) return h_flex().h(ROW).px(8).gap(7).items_center()
+      .when(row.n === undefined, el => el.rounded(6).cursor_pointer().hover(s => s.bg(t.hover)))
       .child(svg("mods/files-search/file.svg").size(14).flex_none().text_color(t.muted))
-      .child(div().flex_none().font_semibold().child(row.name))
+      .child(div().flex_none().when(row.n !== undefined, el => el.font_semibold()).child(row.name))
       .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(row.dir))
-      .child(div().flex_none().text_size(11).text_color(t.dim).child(String(row.n)));
+      .when(row.n !== undefined, el => el.child(div().flex_none().text_size(11).text_color(t.dim).child(String(row.n))));
     return h_flex().h(ROW).pl(12).pr(8).gap(8).items_center().rounded(6).cursor_pointer().hover(s => s.bg(t.hover))
       .child(div().flex_none().w(34).text_right().text_size(11).text_color(t.dim).child(String(row.line)))
       .child(h_flex().flex_1().min_w(0).overflow_hidden().text_size(12).when(Boolean(mono), el => el.font_family(mono))
@@ -292,8 +348,22 @@ export default class Files extends View {
         .child(div().flex_1().min_w(0).truncate().child(row.rest)));
   }
 
+  modeButton(mode, label, t) {
+    const on = this.mode === mode;
+    return div().id(`files-mode-${mode}`).h(30).flex_none().px(9).flex().items_center().rounded(6).cursor_pointer().text_size(12)
+      .border(1).border_color(on ? t.accent : t.input).text_color(on ? t.foreground : t.muted)
+      .when(on, el => el.bg(t.selected)).hover(s => s.bg(t.hover).text_color(t.foreground))
+      .on_click((_e, cx) => this.setMode(mode, cx)).child(label);
+  }
+
   searchStatus() {
     if (this.searchError) return this.searchError;
+    if (this.searchMode === "name") {
+      const found = `${this.count.toLocaleString()} files`;
+      if (this.searching) return this.count ? `Searching… ${found}` : "Searching…";
+      if (this.capped) return `Showing the first ${MATCHES.toLocaleString()} files`;
+      return this.count ? found : "No files";
+    }
     const files = this.headers.size, found = `${this.count.toLocaleString()} results in ${files.toLocaleString()} files`;
     if (this.searching) return this.count ? `Searching… ${found}` : "Searching…";
     if (this.capped) return `Showing the first ${MATCHES.toLocaleString()} results in ${files.toLocaleString()} files`;
@@ -308,8 +378,10 @@ export default class Files extends View {
         .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.show(null); cx.notify(); }).child("←")))
         .child(div().font_semibold().child("Files"))
         .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.file ?? this.root?.split(/[\\/]/).pop() ?? "")))
-      .when(!this.file, el => el.child(div().flex_none().px(8).pt(8).pb(4)
-        .child(Input.new(this.query).h(30).px(10).items_center().rounded(6).border(1).border_color(this.queryFocused ? t.accent : t.input).bg(t.background).text_color(t.foreground))))
+      .when(!this.file, el => el.child(h_flex().flex_none().px(8).pt(8).pb(4).gap(6).items_center()
+        .child(Input.new(this.query).flex_1().min_w(0).h(30).px(10).items_center().rounded(6).border(1).border_color(this.queryFocused ? t.accent : t.input).bg(t.background).text_color(t.foreground))
+        .child(this.modeButton("name", "Name", t))
+        .child(this.modeButton("content", "Content", t))))
       .when(!this.file && Boolean(this.query.value()), el => {
         const mono = settings().font_family;
         return el.child(div().flex_none().px(14).pb(4).text_size(11).text_color(this.searchError ? t.ansi1 : t.dim).child(this.searchStatus()))
