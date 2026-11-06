@@ -1,0 +1,17 @@
+oh-my-herdr
+Copyright (C) 2026 m16khb
+
+This project is distributed under the GNU General Public License v3.0
+(see LICENSE).
+
+It contains layouts and mods derived from the Herdr desktop app
+(https://github.com/herdrdev/herdr-app), licensed under the Apache License,
+Version 2.0. A copy of that license is in licenses/Apache-2.0-herdr-app.txt.
+Herdr is a trademark/name of its respective owners; this project is not
+affiliated with or endorsed by them.
+
+Bundled fonts keep their own licenses:
+- mods/win98/fonts/PixelatedMSSansSerif-*.ttf: CC BY-SA 3.0
+  (mods/win98/fonts/LICENSE-MSSansSerif.txt)
+- mods/win98/fonts/PxPlus_IBM_VGA_8x16.ttf: CC BY-SA 4.0
+  (mods/win98/fonts/LICENSE-PxPlus.txt)
