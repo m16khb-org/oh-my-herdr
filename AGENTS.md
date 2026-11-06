@@ -8,19 +8,27 @@ files.
 
 ## When asked to install
 
-Follow [INSTALL.md](INSTALL.md). In short:
+Run the install script from the repository root. Don't copy files by hand.
 
-1. Find the Herdr app folder: `$HERDR_APP_HOME` if set, else
-   `~/.config/herdr-app` (Windows: `$HOME\.config\herdr-app`).
-2. Make sure `rg` runs (`rg --version`). If it doesn't, install ripgrep with
-   the command for the OS in INSTALL.md.
-3. Copy `mods/files-search` to `<app folder>/mods/files-search` and
-   `layouts/main-search.json` to `<app folder>/layouts/main-search.json`.
-4. Run `herdr-app check <app folder>/mods/files-search`. It must print
-   `check passed`.
-5. If Herdr is running, run `herdr-app do layout.switch --name main-search`,
-   then `herdr-app status`. Expect `"layout": "main-search"` and an empty
-   `errors` list.
+- macOS / Linux: `sh install.sh`
+- Windows: `powershell -ExecutionPolicy Bypass -File install.ps1`
+
+The script copies `mods/files-search` and `layouts/main-search.json` into the
+Herdr app folder (`$HERDR_APP_HOME`, else `~/.config/herdr-app`). Then it runs
+`herdr-app check`, and switches to `main-search` if Herdr is running. It
+exits non-zero if the check fails.
+
+Then:
+
+1. If the output says ripgrep is missing, run the install command it prints.
+   Ask the user before you install packages.
+2. If Herdr was running, run `herdr-app status`. Expect
+   `"layout": "main-search"` and an empty `errors` list.
+3. If Herdr wasn't running, tell the user to start it and run
+   `herdr-app do layout.switch --name main-search`.
+
+To uninstall, run the same script with `--uninstall` (`-Uninstall` on
+Windows).
 
 Rules:
 

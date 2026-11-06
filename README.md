@@ -16,7 +16,19 @@ app's Files panel, on Windows, macOS, Linux and remote machines.
 
 ## Install
 
-See [INSTALL.md](INSTALL.md).
+macOS / Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/m16khb-org/oh-my-herdr/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/m16khb-org/oh-my-herdr/main/install.ps1 | iex
+```
+
+Requirements, uninstall and platform notes: [INSTALL.md](INSTALL.md).
 
 ## License
 

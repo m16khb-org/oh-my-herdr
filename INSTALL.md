@@ -34,46 +34,39 @@ after you install it, restart Herdr so it picks up the new `PATH`.
 
 ## Install
 
-Install only `mods/files-search` and `layouts/main-search.json`. The other
-folders under `mods/` and `layouts/` are copies of Herdr's built-in files.
-Herdr installs and updates its own copies, so don't copy them over.
-
-The commands below use Herdr's default app folder, `~/.config/herdr-app`.
-If you set `HERDR_APP_HOME`, use that folder instead.
+Run one command. It installs `mods/files-search` and
+`layouts/main-search.json` into Herdr's app folder, then runs
+`herdr-app check` on the mod. If Herdr is running, it also switches to the
+`main-search` layout. It never touches Herdr's built-in mods.
 
 macOS / Linux:
 
 ```sh
-git clone https://github.com/m16khb-org/oh-my-herdr.git
-cd oh-my-herdr
-mkdir -p ~/.config/herdr-app/mods ~/.config/herdr-app/layouts
-cp -R mods/files-search ~/.config/herdr-app/mods/
-cp layouts/main-search.json ~/.config/herdr-app/layouts/
+curl -fsSL https://raw.githubusercontent.com/m16khb-org/oh-my-herdr/main/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-git clone https://github.com/m16khb-org/oh-my-herdr.git
-cd oh-my-herdr
-$herdr = "$HOME\.config\herdr-app"
-New-Item -ItemType Directory -Force "$herdr\mods", "$herdr\layouts" | Out-Null
-Copy-Item -Recurse -Force mods\files-search "$herdr\mods\"
-Copy-Item -Force layouts\main-search.json "$herdr\layouts\"
+irm https://raw.githubusercontent.com/m16khb-org/oh-my-herdr/main/install.ps1 | iex
 ```
 
-Check the mod and switch to the layout (any OS):
+From a clone, run the script in the repository instead:
 
 ```sh
-herdr-app check ~/.config/herdr-app/mods/files-search
-herdr-app do layout.switch --name main-search
+sh install.sh                                          # macOS / Linux
+powershell -ExecutionPolicy Bypass -File install.ps1   # Windows
 ```
 
-On Windows, use `$HOME\.config\herdr-app\mods\files-search` as the
-`check` path. Open the panel with the **Files** button at the top right.
+The scripts install into `$HERDR_APP_HOME` if you set it, else
+`~/.config/herdr-app`. If Herdr isn't running, start it and run
+`herdr-app do layout.switch --name main-search`. Open the panel with the
+**Files** button at the top right.
 
 `main-search` is Herdr's `main` layout, with the Files panel running
-`files-search` in place of the built-in `files` mod.
+`files-search` in place of the built-in `files` mod. Don't copy the other
+folders under `mods/` and `layouts/` into Herdr: they are copies of Herdr's
+built-in files, which Herdr installs and updates itself.
 
 ## Platform notes
 
@@ -87,22 +80,24 @@ On Windows, use `$HOME\.config\herdr-app\mods\files-search` as the
 
 ## Update
 
-Pull the repository and run the copy commands again. Herdr reloads the mod as
-soon as the files change.
+Run the install command again. Herdr reloads the mod as soon as the files
+change.
 
 ## Uninstall
 
-```sh
-herdr-app do layout.switch --name main
-rm -rf ~/.config/herdr-app/mods/files-search ~/.config/herdr-app/layouts/main-search.json
-```
+The uninstall switches Herdr back to `main` if it shows `main-search`, then
+removes both files.
 
-Windows:
+```sh
+curl -fsSL https://raw.githubusercontent.com/m16khb-org/oh-my-herdr/main/install.sh | sh -s -- --uninstall
+```
 
 ```powershell
-herdr-app do layout.switch --name main
-Remove-Item -Recurse -Force "$HOME\.config\herdr-app\mods\files-search", "$HOME\.config\herdr-app\layouts\main-search.json"
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/m16khb-org/oh-my-herdr/main/install.ps1))) -Uninstall
 ```
+
+From a clone: `sh install.sh --uninstall`, or
+`powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall`.
 
 If a layout ever leaves the window unusable, `Ctrl+Alt+Shift+Escape` always
 switches back to the default `main` layout.
