@@ -38,6 +38,9 @@ Install only `mods/files-search` and `layouts/main-search.json`. The other
 folders under `mods/` and `layouts/` are copies of Herdr's built-in files.
 Herdr installs and updates its own copies, so don't copy them over.
 
+The commands below use Herdr's default app folder, `~/.config/herdr-app`.
+If you set `HERDR_APP_HOME`, use that folder instead.
+
 macOS / Linux:
 
 ```sh

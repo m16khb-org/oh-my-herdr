@@ -11,7 +11,8 @@ app's Files panel, on Windows, macOS, Linux and remote machines.
   the Files panel.
 - Other `mods/` and `layouts/`: Herdr 0.1.13's built-in mods and layouts, for
   reference. Don't install these.
-- `AGENTS.md`: the Herdr app's interface reference for coding agents.
+- `AGENTS.md`: install and change notes for coding agents.
+- `docs/herdr-app-AGENTS.md`: the Herdr app's interface reference (mod API).
 
 ## Install
 
