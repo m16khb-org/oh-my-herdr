@@ -1,19 +1,21 @@
 # oh-my-herdr
 
-Layouts and mods for the [Herdr](https://herdr.dev) desktop app.
+File name and content search for the [Herdr](https://herdr.dev) desktop
+app's Files panel, on Windows, macOS, Linux and remote machines.
 
 ## Contents
 
-- `layouts/`: window layouts (`main`, `main-search`, `terminals`, `win98`).
-- `mods/`: panels and UI mods (spaces, tabs, agents, files, changes, worktree,
-  workspace chrome, `win98` theme, and more).
+- `mods/files-search/`: the Files panel with a search box (**Name** /
+  **Content**), backed by ripgrep.
+- `layouts/main-search.json`: Herdr's `main` layout using `files-search` for
+  the Files panel.
+- Other `mods/` and `layouts/`: Herdr 0.1.13's built-in mods and layouts, for
+  reference. Don't install these.
 - `AGENTS.md`: the Herdr app's interface reference for coding agents.
 
 ## Install
 
-Copy `layouts/` and `mods/` into `~/.config/herdr-app/`. The app reloads
-changes within a second. Check a mod with
-`herdr-app check ~/.config/herdr-app/mods/<name>`.
+See [INSTALL.md](INSTALL.md).
 
 ## License
 
