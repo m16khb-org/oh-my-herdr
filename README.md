@@ -1,12 +1,14 @@
 # oh-my-herdr
 
-File name and content search for the [Herdr](https://herdr.dev) desktop
-app's Files panel, on Windows, macOS, Linux and remote machines.
+File name and content search, Markdown previews and file editing for the
+[Herdr](https://herdr.dev) desktop app's Files panel, on Windows, macOS, Linux
+and remote machines.
 
 ## Contents
 
 - `mods/files-search/`: the Files panel with a search box (**Name** /
-  **Content**), backed by ripgrep.
+  **Content**), backed by ripgrep, an editor for this computer's files, and
+  a live Markdown preview beside the text.
 - `layouts/main-search.json`: Herdr's `main` layout using `files-search` for
   the Files panel.
 - Other `mods/` and `layouts/`: Herdr 0.1.13's built-in mods and layouts, for

@@ -1,7 +1,7 @@
 # Installing oh-my-herdr
 
-oh-my-herdr adds search to the Herdr app's **Files** panel. A search box sits
-at the top of the panel, with two modes:
+oh-my-herdr adds search, Markdown previews and editing to the Herdr app's
+**Files** panel. A search box sits at the top of the panel, with two modes:
 
 - **Name**: file names containing the query. A query with `/` matches the
   whole relative path (`mods/files` finds `mods/files-search/main.js`).
@@ -11,6 +11,18 @@ at the top of the panel, with two modes:
 Both modes are case-insensitive unless the query has a capital letter. They
 search hidden files, respect `.gitignore`, and skip `.git`. Click a result to
 preview the file. Clear the box to get the folder tree back.
+
+Files on this computer open ready to edit. Once you change one, **Save**
+(or `Cmd+S`, `Ctrl+S` on Windows and Linux) and **Discard** appear at the top
+right, and the panel stays on that file until you pick one. Save never
+overwrites a file that changed elsewhere since you opened it: it shows an
+error and keeps your draft, and Discard loads the file again. Files on other
+machines, and files too long to preview whole (over 400,000 characters), are
+read-only.
+
+Markdown files (`.md`, `.markdown`, `.mdown`, `.mkd`) open in **Split**: the
+text on top and the rendered page below, which follows as you type. **View**
+shows only the rendered page, **Code** only the text.
 
 The panel searches the focused pane's folder, on the machine that pane runs
 on (this computer or a machine added in Herdr).
