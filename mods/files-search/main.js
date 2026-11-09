@@ -15,6 +15,9 @@ const key = () => JSON.stringify(location());
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
 const MARKDOWN = new Set(["md", "markdown", "mdown", "mkd"]);
 const PREVIEW_CHARS = 400000;
+// Herdr's editor spends 0.5–2 s highlighting 20,000 characters of code and lags while you type in a big
+// highlighted file; plain text costs milliseconds. Larger files open plain, and the Color button turns it on.
+const PLAIN_CHARS = 20000;
 const PER_FOLDER = 500, TOTAL = 5000;
 const MATCHES = 2000, POLL_MS = 120, CHUNK = 1 << 20, ROW = 24;
 // rg runs in the background and writes its output to a temp file; the panel reads new lines while it runs.
@@ -183,7 +186,7 @@ export default class Files extends View {
   }
 
   show(path, cx) {
-    this.code?.release(); this.code = null; this.markdown = null; this.file = path; this.fileError = null;
+    this.code?.release(); this.code = null; this.markdown = null; this.file = path; this.fileError = null; this.plain = false;
     this.original = null; this.dirty = false; this.saving = false; this.saveError = null; this.renderMd?.cancel();
     if (!path || !cx) return;
     const context = this.context, root = this.root, on = this.on;
@@ -197,6 +200,7 @@ export default class Files extends View {
         if (MARKDOWN.has(this.ext().toLowerCase())) this.markdown = value;
         // writeTextFile writes only on this computer, and a truncated preview must never be saved.
         if (!on && value === text) this.original = text;
+        this.plain = value.length > PLAIN_CHARS;
         this.code = this.editor(value, this.original === null);
       } catch { if (this.file === path && this.current(context)) this.fileError = "Cannot preview this file (binary, too large, or unreadable)"; }
       finally { cx.notify(); }
@@ -209,7 +213,7 @@ export default class Files extends View {
 
   editor(value, readonly) {
     const t = theme(), ext = this.ext();
-    const state = EditorState.new({ language: LANG[ext] ?? ext, readonly, value,
+    const state = EditorState.new({ language: this.plain ? "text" : LANG[ext] ?? ext, readonly, value,
       font_family: settings().font_family, font_size: 12,
       syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 } });
     if (!readonly) state.on("change", (_e, cx) => {
@@ -223,6 +227,15 @@ export default class Files extends View {
       }
     });
     return state;
+  }
+
+  // A new editor with the same text, since the language is fixed at creation; the cursor goes back to the top.
+  toggleColor(cx) {
+    const old = this.code;
+    this.plain = !this.plain;
+    this.code = this.editor(old.value(), this.original === null);
+    old.release();
+    cx.notify();
   }
 
   // Writes only if the file still holds what was read: a change made elsewhere is never overwritten.
@@ -255,12 +268,15 @@ export default class Files extends View {
     return v_flex().flex_1().min_h(0).child(editor()).child(preview().border_t(1).border_color(t.border));
   }
 
-  viewButton(view, label, t) {
-    const on = (this.mdView ?? "split") === view;
-    return div().id(`files-view-${view}`).flex_none().px(7).h(24).flex().items_center().rounded(6).cursor_pointer().text_size(12)
+  toggleButton(id, label, on, t, onClick) {
+    return div().id(id).flex_none().px(7).h(24).flex().items_center().rounded(6).cursor_pointer().text_size(12)
       .border(1).border_color(on ? t.accent : t.input).text_color(on ? t.foreground : t.muted)
       .when(on, el => el.bg(t.selected)).hover(s => s.bg(t.hover).text_color(t.foreground))
-      .on_click((_e, cx) => { this.mdView = view; cx.notify(); }).child(label);
+      .on_click((_e, cx) => onClick(cx)).child(label);
+  }
+
+  viewButton(view, label, t) {
+    return this.toggleButton(`files-view-${view}`, label, (this.mdView ?? "split") === view, t, cx => { this.mdView = view; cx.notify(); });
   }
 
   headerButton(id, label, t, onClick, color) {
@@ -452,6 +468,7 @@ export default class Files extends View {
         .child(div().font_semibold().child("Files"))
         .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.file ?? this.root?.split(/[\\/]/).pop() ?? ""))
         .when(Boolean(this.code) && this.original === null, el => el.child(div().flex_none().text_size(11).text_color(t.dim).child("Read-only")))
+        .when(Boolean(this.code), el => el.child(this.toggleButton("files-color", "Color", !this.plain, t, cx => this.toggleColor(cx))))
         .when(this.markdown != null, el => el.child(h_flex().flex_none().gap(4)
           .child(this.viewButton("split", "Split", t)).child(this.viewButton("view", "View", t)).child(this.viewButton("code", "Code", t))))
         // Discard reads the file again, so a file changed elsewhere shows its new text.

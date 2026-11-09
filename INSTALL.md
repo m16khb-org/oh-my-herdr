@@ -20,6 +20,11 @@ error and keeps your draft, and Discard loads the file again. Files on other
 machines, and files too long to preview whole (over 400,000 characters), are
 read-only.
 
+Files over 20,000 characters open without syntax colors, because Herdr's
+editor lags while you type in a large highlighted file. **Color** at the top
+right turns colors on or off for the open file; switching moves the cursor
+back to the top.
+
 Markdown files (`.md`, `.markdown`, `.mdown`, `.mkd`) open in **Split**: the
 text on top and the rendered page below, which follows as you type. **View**
 shows only the rendered page, **Code** only the text.
