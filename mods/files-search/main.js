@@ -39,10 +39,37 @@ const STOP = 'kill "$2" 2>/dev/null; rm -f "$1"';
 // image() draws only files under the app folder, so a picture is copied into this mod's cache first.
 const IMAGES = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "svg"]);
 const IMAGE_DIR = "mods/files-search/.cache", IMAGE_CACHE = 24, IMAGE_HEADER = 40, IMAGE_PAD = 16;
-// exec answers at most 8 MiB and base64 grows a file by a third; fs reads this computer's home folder directly.
-const EXEC_IMAGE_BYTES = 6 << 20, IMAGE_BYTES = 64 << 20;
-const IMAGE_SH = 'f=$1; [ -f "$f" ] || { echo missing; exit 0; }; n=$(wc -c < "$f" | tr -d " ") || exit 1; if [ "$n" -gt "$2" ]; then echo "big $n"; exit 0; fi; echo "ok $n"; if command -v base64 >/dev/null 2>&1; then base64 < "$f"; else openssl base64 < "$f"; fi';
-const IMAGE_PS = "param($p, $m) $i = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue; if (-not $i -or $i.PSIsContainer) { 'missing' } elseif ($i.Length -gt [long]$m) { 'big ' + $i.Length } else { 'ok ' + $i.Length; [Convert]::ToBase64String([IO.File]::ReadAllBytes($i.FullName)) }";
+// A picture is read once for what the dialog needs (its first bytes, for the pixel size, and a name for its
+// cached copy) and then copied into the cache. A file here is copied by this computer's shell. One on another
+// machine comes as base64 in pieces of IMAGE_CHUNK bytes, one exec each (exec answers at most 8 MiB); a multiple
+// of 3 bytes, so the pieces' base64 joins into one text, which is written here and decoded by this computer's shell.
+// The link to another machine can be slow, so a picture there larger than PREVIEW_OVER travels as a preview at
+// most 2048 px across, made there by sips (macOS) or ImageMagick, when one is smaller than the picture itself.
+const IMAGE_BYTES = 64 << 20, IMAGE_CHUNK = 3 << 19, PREVIEW_OVER = 512 << 10, IMAGE_TIMEOUT = 300000;
+// Photos become JPEG; PNG and WebP stay PNG, which keeps transparency. GIF keeps its animation, SVG is text.
+const PREVIEW_AS = { jpg: "jpeg", jpeg: "jpeg", bmp: "jpeg", tif: "jpeg", tiff: "jpeg", png: "png", webp: "png" };
+// The first 768 KiB are decoded for the pixel size: 1 MiB of base64, a multiple of 4 characters.
+const IMAGE_HEAD_BASE64 = 1 << 20;
+// Arguments: file, piece, largest size, piece size, preview format or "-", PREVIEW_OVER, "rm" to delete a preview
+// after its last piece. Answers "ok <size> <size read> <width or -> <height or -> <file read>", then the piece.
+// A preview that fits in one piece is deleted at once; a larger one is named again for the next pieces.
+const IMAGE_SH = 'f=$1; [ -f "$f" ] || { echo missing; exit 0; }; n=$(wc -c < "$f" | tr -d " ") || exit 1; r=$f; m=$n; d="- -"; '
+  + 'if [ "$5" != - ] && [ "$n" -gt "$6" ] && t=$(mktemp "${TMPDIR:-/tmp}/herdr-preview.XXXXXX" 2>/dev/null); then '
+  + 'if command -v sips >/dev/null 2>&1; then d=$(sips -g pixelWidth -g pixelHeight "$f" 2>/dev/null | awk \'/pixelWidth/ { w = $2 } /pixelHeight/ { h = $2 } END { if (w && h) print w, h }\'); '
+  // sips -Z enlarges a smaller picture too, so it is used only above 2048 px (or when the size is unknown).
+  + 'z="-Z 2048"; case $d in [0-9]*" "[0-9]*) [ "${d% *}" -le 2048 ] && [ "${d#* }" -le 2048 ] && z=;; esac; sips $z -s format "$5" "$f" --out "$t" >/dev/null 2>&1; '
+  + 'elif command -v magick >/dev/null 2>&1; then d=$(magick identify -format "%w %h" "$f[0]" 2>/dev/null); magick "$f[0]" -resize "2048x2048>" "$5:$t" 2>/dev/null; '
+  + 'elif command -v convert >/dev/null 2>&1; then d=$(identify -format "%w %h" "$f[0]" 2>/dev/null); convert "$f[0]" -resize "2048x2048>" "$5:$t" 2>/dev/null; fi; '
+  + 's=$(wc -c < "$t" 2>/dev/null | tr -d " "); if [ -n "$s" ] && [ "$s" -gt 0 ] && [ "$s" -lt "$n" ]; then r=$t; m=$s; case $d in [0-9]*" "[0-9]*) ;; *) d="- -";; esac; else rm -f "$t"; d="- -"; fi; fi; '
+  + 'echo "ok $n $m $d $r"; '
+  + 'if [ "$m" -le "$3" ]; then dd if="$r" bs="$4" skip="$2" count=1 2>/dev/null | if command -v base64 >/dev/null 2>&1; then base64; else openssl base64; fi; fi; '
+  + 'if [ "$r" != "$f" ] && { [ "$m" -le "$4" ] || [ "$m" -gt "$3" ]; }; then rm -f "$r"; fi; '
+  + 'if [ "$7" = rm ]; then case $f in */herdr-preview.*) rm -f "$f";; esac; fi';
+const DROP_PREVIEW_SH = 'case $1 in */herdr-preview.*) rm -f "$1";; esac';
+// Windows machines without sh send the picture itself.
+const IMAGE_PS = "param($p, $k, $m, $c) $i = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue; if (-not $i -or $i.PSIsContainer) { 'missing'; return }; 'ok ' + $i.Length + ' ' + $i.Length + ' - - ' + $p; if ($i.Length -gt [long]$m) { return }; "
+  + "$at = [long]$k * [long]$c; $b = New-Object byte[] ([Math]::Max(0, [Math]::Min([long]$c, $i.Length - $at))); $s = [IO.File]::OpenRead($i.FullName); "
+  + "try { [void]$s.Seek($at, 'Begin'); $r = 0; while ($r -lt $b.Length) { $x = $s.Read($b, $r, $b.Length - $r); if ($x -le 0) { break }; $r += $x }; [Convert]::ToBase64String($b, 0, $r) } finally { $s.Close() }";
 const megabytes = n => `${(n / (1 << 20)).toFixed(1)} MB`;
 const byteSize = n => n < 1024 ? `${n} B` : n < 1 << 20 ? `${Math.round(n / 1024)} KB` : megabytes(n);
 const isImage = path => IMAGES.has(path.slice(path.lastIndexOf(".") + 1).toLowerCase()) && path.includes(".");
@@ -51,54 +78,103 @@ const isImage = path => IMAGES.has(path.slice(path.lastIndexOf(".") + 1).toLower
 const quotePs = text => "'" + text.replace(/['‘’‚‛]/g, "$&$&") + "'";
 // Each machine answers in sh, or in PowerShell when it is Windows (this one, or another without sh).
 const shells = new Map();
-async function shell(on, sh, ps, args) {
+async function shell(on, sh, ps, args, options = {}) {
   const kind = shells.get(on ?? "") ?? (!on && window()?.platform === "windows" ? "ps" : "sh");
   if (kind === "sh") {
-    try { return await exec("sh", ["-c", sh, "files", ...args], { on }); }
+    try { return await exec("sh", ["-c", sh, "files", ...args], { ...options, on }); }
     catch (e) {
       if (!on || !String(e).includes("cannot start sh: program not found")) throw e;
       shells.set(on, "ps");
     }
   }
   // Windows PowerShell otherwise uses the console code page; exec decodes UTF-8.
-  return exec("powershell", ["-NoProfile", "-Command", `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { ${ps} } ${args.map(quotePs).join(" ")}`], { on });
+  return exec("powershell", ["-NoProfile", "-Command", `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { ${ps} } ${args.map(quotePs).join(" ")}`], { ...options, on });
 }
 
-// Reads a picture here or on another machine: Unix machines answer with base64 through sh, Windows through PowerShell.
-async function imageBytes(path, on) {
+
+// Herdr 0.1.15 hands a Uint8Array (a Buffer too) from a script to its own functions as no bytes at all:
+// createHash and fs.writeFile see nothing, and Buffer's toString gives "". An ArrayBuffer and a string arrive
+// whole, so pictures are hashed as those and never written from a script's bytes.
+const arrayBuffer = b => b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+const tooLarge = n => new Error(`Image too large to preview (${megabytes(n)}, limit ${megabytes(IMAGE_BYTES)})`);
+const COPY_FILE_SH = 'cp -f -- "$1" "$2" && wc -c < "$2" | tr -d " "';
+const COPY_FILE_PS = "param($a, $b) Copy-Item -LiteralPath $a -Destination $b -Force -ErrorAction Stop; (Get-Item -LiteralPath $b).Length";
+const DECODE_SH = 'if base64 -d < "$1" > "$2" 2>/dev/null || base64 -D < "$1" > "$2" 2>/dev/null || openssl base64 -d -A -in "$1" -out "$2"; then wc -c < "$2" | tr -d " "; fi; rm -f "$1"';
+const DECODE_PS = "param($i, $o) try { [IO.File]::WriteAllBytes($o, [Convert]::FromBase64String([IO.File]::ReadAllText($i))); (Get-Item -LiteralPath $o).Length } finally { Remove-Item -LiteralPath $i -ErrorAction SilentlyContinue }";
+
+// Runs one of the scripts above on this computer; it answers with the size of the file it wrote.
+async function writeChecked(sh, ps, args, file, size) {
+  const r = await shell(null, sh, ps, args);
+  if (r.code === 0 && Number(r.stdout.trim()) === size) return;
+  await fs.unlink(file).catch(() => null);
+  throw new Error(r.stderr.trim().split("\n")[0] || "Cannot copy this image into the preview cache");
+}
+
+// What openImage needs of a picture here or on another machine: { head, size, dims, preview, ext, key, write(file) }.
+// head: its first bytes; size and dims: the picture's own; ext: what the cached copy is (a preview is JPEG or PNG).
+// progress(done, total) follows the pieces of a picture that takes more than one.
+async function imageSource(path, on, progress) {
+  const ext = path.slice(path.lastIndexOf(".") + 1).toLowerCase();
   if (!on) {
     let bytes = null;
     try { bytes = await fs.readFile(path); } catch { /* outside the home folder: ask a shell */ }
-    if (bytes) {
-      if (bytes.length > IMAGE_BYTES) throw new Error(`Image too large to preview (${megabytes(bytes.length)}, limit ${megabytes(IMAGE_BYTES)})`);
-      return bytes;
+    if (bytes?.length) {
+      if (bytes.length > IMAGE_BYTES) throw tooLarge(bytes.length);
+      const size = bytes.length;
+      return { head: bytes, size, dims: null, preview: false, ext, key: createHash("sha1").update(arrayBuffer(bytes)).digest("hex"),
+        write: file => writeChecked(COPY_FILE_SH, COPY_FILE_PS, [path, file], file, size) };
     }
   }
-  const r = await shell(on, IMAGE_SH, IMAGE_PS, [path, String(EXEC_IMAGE_BYTES)]);
-  if (r.code !== 0) throw new Error(r.stderr.trim().split("\n")[0] || "Cannot read this image");
-  const out = r.stdout, nl = out.indexOf("\n"), head = (nl < 0 ? out : out.slice(0, nl)).trim();
-  if (head === "missing") throw new Error("This file is no longer available");
-  if (head.startsWith("big ")) throw new Error(`Image too large to preview (${megabytes(Number(head.slice(4)))}, limit ${megabytes(EXEC_IMAGE_BYTES)})`);
-  if (!head.startsWith("ok ") || nl < 0) throw new Error("Cannot read this image");
-  return Buffer.from(out.slice(nl + 1).replace(/\s+/g, ""), "base64");
+  const pieces = [];
+  let read = path, total = 0, size = 0, dims = null;
+  try {
+    for (let k = 0; k === 0 || k * IMAGE_CHUNK < total; k++) {
+      const last = (k + 1) * IMAGE_CHUNK >= total;
+      const args = [read, String(k), String(IMAGE_BYTES), String(IMAGE_CHUNK), k === 0 ? PREVIEW_AS[ext] ?? "-" : "-", String(PREVIEW_OVER), k > 0 && last && read !== path ? "rm" : "-"];
+      const r = await shell(on, IMAGE_SH, IMAGE_PS, args, { timeout: IMAGE_TIMEOUT });
+      if (r.code !== 0) throw new Error(r.stderr.trim().split("\n")[0] || "Cannot read this image");
+      const out = r.stdout, nl = out.indexOf("\n"), status = (nl < 0 ? out : out.slice(0, nl)).trim();
+      if (status === "missing") throw new Error(k === 0 ? "This file is no longer available" : "The preview was removed while it was being read; open it again");
+      const m = status.match(/^ok (\d+) (\d+) (\S+) (\S+) (.*)$/);
+      if (!m) throw new Error("Cannot read this image");
+      if (k === 0) {
+        size = Number(m[1]); total = Number(m[2]); read = m[5];
+        if (/^\d+$/.test(m[3]) && /^\d+$/.test(m[4])) dims = [Number(m[3]), Number(m[4])];
+        if (total > IMAGE_BYTES) throw tooLarge(total);
+      } else if (Number(m[1]) !== total) throw new Error("The image changed while it was being read; open it again");
+      pieces.push(nl < 0 ? "" : out.slice(nl + 1).replace(/\s+/g, ""));
+      if (total > IMAGE_CHUNK) progress?.(Math.min((k + 1) * IMAGE_CHUNK, total), total);
+    }
+  } catch (e) {
+    if (read !== path) await shell(on, DROP_PREVIEW_SH, "", [read]).catch(() => null);
+    throw e;
+  }
+  const text = pieces.join(""), preview = read !== path;
+  return { head: Buffer.from(text.slice(0, IMAGE_HEAD_BASE64), "base64"), size, dims, preview,
+    ext: preview ? (PREVIEW_AS[ext] === "jpeg" ? "jpg" : "png") : ext, key: createHash("sha1").update(text).digest("hex"),
+    write: async file => { await fs.writeFile(`${file}.b64`, text); await writeChecked(DECODE_SH, DECODE_PS, [`${file}.b64`, file], file, total); } };
 }
 
-// Named by content, so a changed picture is a new file and an unchanged one is written once.
+// Named by content, so a changed picture is a new file and an unchanged one is written once per session
+// (a copy pruned or left short by an earlier failed write is written again).
 let cached = [];
-async function cacheImage(bytes, ext) {
-  const name = `${createHash("sha1").update(bytes).digest("hex").slice(0, 20)}.${ext.toLowerCase()}`;
-  const dir = `${appHome()}/${IMAGE_DIR}`;
+const written = new Set();
+async function cacheImage(source, ext) {
+  const name = `${source.key.slice(0, 20)}.${ext.toLowerCase()}`;
+  const dir = `${appHome()}/${IMAGE_DIR}`, file = `${dir}/${name}`;
   await fs.mkdir(dir, { recursive: true });
-  if (!(await fs.exists(`${dir}/${name}`))) await fs.writeFile(`${dir}/${name}`, bytes);
+  if (!written.has(name) || !(await fs.exists(file))) { await source.write(file); written.add(name); }
   cached = [name, ...cached.filter(n => n !== name)].slice(0, IMAGE_CACHE);
   const files = await fs.readdir(dir).catch(() => []);
-  if (files.length > IMAGE_CACHE) for (const f of files) if (!cached.includes(f)) await fs.unlink(`${dir}/${f}`).catch(() => null);
+  // A .b64 file is another picture still being written.
+  if (files.length > IMAGE_CACHE) for (const f of files) if (!cached.includes(f) && !f.endsWith(".b64")) await fs.unlink(`${dir}/${f}`).catch(() => null);
   return `${IMAGE_DIR}/${name}`;
 }
 
 // An SVG's own size, from width and height in px or else its viewBox; null when it states neither.
 function svgSize(b) {
-  const tag = Buffer.from(b.subarray(0, 4096)).toString("utf8").match(/<svg\b[^>]*>/i)?.[0];
+  // Read byte by byte: Buffer's toString gives "" on Herdr 0.1.15, and the attributes needed here are ASCII.
+  const tag = String.fromCharCode.apply(null, b.subarray(0, 4096)).match(/<svg\b[^>]*>/i)?.[0];
   if (!tag) return null;
   const attr = name => tag.match(new RegExp(`\\s${name}\\s*=\\s*["']([^"']*)["']`, "i"))?.[1];
   const px = v => /^\s*[\d.]+\s*(px)?\s*$/.test(v ?? "") ? parseFloat(v) : NaN;
@@ -176,7 +252,7 @@ async function writeRemoteText(path, text, expected, on) {
     chunks.push(text.slice(i, end));
     i = end;
   }
-  // A string, not a Buffer: Herdr 0.1.15 hashes a Buffer as no bytes. Strings hash as UTF-8.
+  // A string, not a Buffer: Herdr 0.1.15 hashes a Buffer as no bytes (see arrayBuffer). Strings hash as UTF-8.
   const want = createHash("sha256").update(expected).digest("hex");
   let r;
   try { r = await exec("sh", ["-c", SAVE_SH, "files", path, want, String(utf8Length(text)), ...chunks], { on }); }
@@ -538,10 +614,13 @@ export default class Files extends View {
     cx.notify();
     cx.spawn(async cx => {
       try {
-        const bytes = await imageBytes(`${root}/${path}`, on);
-        const src = await cacheImage(bytes, path.slice(path.lastIndexOf(".") + 1));
+        const source = await imageSource(`${root}/${path}`, on, (done, total) => {
+          if (this.opening === opening) { this.note = { text: `Opening ${name}… ${megabytes(done)} of ${megabytes(total)}` }; cx.notify(); }
+        });
+        const src = await cacheImage(source, source.ext);
         if (this.opening !== opening || !this.current(context)) return;
-        const vector = /\.svg$/i.test(path), size = vector ? svgSize(bytes) : imageSize(bytes), facts = [size && `${size[0]} × ${size[1]}`, byteSize(bytes.length)].filter(Boolean).join(" · ");
+        const vector = /\.svg$/i.test(path), size = vector ? svgSize(source.head) : imageSize(source.head), own = source.dims ?? size;
+        const facts = [own && `${own[0]} × ${own[1]}`, byteSize(source.size), source.preview && "preview"].filter(Boolean).join(" · ");
         // A vector has no pixels of its own: a small one (an icon) is drawn at least 480 px across.
         const shown = size && (vector ? size.map(n => n * Math.max(1, 480 / Math.max(...size))) : size);
         const dialog = this.imageDialogSize(shown);
