@@ -1,5 +1,5 @@
 // A lazy file browser for the focused pane's folder, with bounded previews (Markdown rendered, with its
-// source a click away), editing for this computer's files, and a search by file name or by content that
+// source a click away), editing (on another machine through sh), and a search by file name or by content that
 // streams ripgrep results while it runs. Images open in a dialog: this same mod, opened as an overlay.
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, TextView, v_virtual_list } from "gpui-base";
@@ -146,6 +146,45 @@ const baseName = path => path.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
 const parentOf = path => path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
 const joinPath = (folder, name) => folder ? `${folder}/${name}` : name;
 const inside = (path, folder) => path === folder || path.startsWith(folder + "/");
+
+// writeTextFile writes only on this computer. On another machine the text travels as sh arguments, in chunks
+// under Linux's 128 KiB limit per argument, and the whole save stays well under macOS's 1 MiB for all of them.
+// Like writeTextFile it never overwrites a change made elsewhere: the file must still hash to what was read.
+// It is written beside the file and moved into place with the file's permissions; a symlink is written through.
+const REMOTE_SAVE_BYTES = 256 << 10, ARG_CHUNK = 32768;
+const SAVE_SH = 'f=$1; want=$2; n=$3; shift 3; [ -f "$f" ] || { echo missing; exit 0; }; '
+  + 'cur=$({ sha256sum < "$f" || shasum -a 256 < "$f" || openssl dgst -sha256 -r < "$f"; } 2>/dev/null | cut -c1-64); '
+  + '[ ${#cur} -eq 64 ] || { echo nohash; exit 0; }; [ "$cur" = "$want" ] || { echo changed; exit 0; }; '
+  + 't=$(mktemp "$(dirname -- "$f")/.herdr-save.XXXXXX") || exit 1; '
+  + 'if ! printf %s "$@" > "$t" || [ "$(wc -c < "$t" | tr -d " ")" != "$n" ]; then rm -f "$t"; echo short; exit 0; fi; '
+  + 'if [ -L "$f" ]; then cat "$t" > "$f"; r=$?; rm -f "$t"; [ $r -eq 0 ] && echo ok; exit $r; fi; '
+  + 'm=$(stat -c %a "$f" 2>/dev/null || stat -f %Lp "$f" 2>/dev/null) && chmod "$m" "$t"; '
+  + 'mv -f "$t" "$f" || { rm -f "$t"; exit 1; }; echo ok';
+const SAVE_ERRORS = {
+  missing: "This file is no longer available",
+  changed: "The file changed since it was opened; Discard to load it again",
+  nohash: "Cannot save here: this machine has no sha256sum, shasum or openssl",
+  short: "The file could not be written in full; it was left unchanged",
+};
+
+async function writeRemoteText(path, text, expected, on) {
+  const chunks = [];
+  for (let i = 0; i < text.length;) {
+    let end = Math.min(i + ARG_CHUNK, text.length);
+    // Never between the two halves of a surrogate pair: each argument is sent as UTF-8.
+    if (end < text.length && (text.charCodeAt(end - 1) & 0xfc00) === 0xd800) end--;
+    chunks.push(text.slice(i, end));
+    i = end;
+  }
+  // A string, not a Buffer: Herdr 0.1.15 hashes a Buffer as no bytes. Strings hash as UTF-8.
+  const want = createHash("sha256").update(expected).digest("hex");
+  let r;
+  try { r = await exec("sh", ["-c", SAVE_SH, "files", path, want, String(utf8Length(text)), ...chunks], { on }); }
+  catch (e) { throw String(e).includes("program not found") ? new Error("Saving needs sh on that machine") : e; }
+  const out = r.stdout.trim();
+  if (out === "ok" && r.code === 0) return;
+  throw new Error(SAVE_ERRORS[out] ?? (r.stderr.trim().split("\n")[0] || "The file could not be saved"));
+}
 
 async function fileOp(on, sh, ps, from, to) {
   const r = await shell(on, sh, ps, [from, to]);
@@ -564,8 +603,9 @@ export default class Files extends View {
         if (text.includes("\0")) { this.fileError = "Binary file · no text preview"; return; }
         const value = text.length > PREVIEW_CHARS ? text.slice(0, PREVIEW_CHARS) + "\n… (file truncated)" : text;
         if (MARKDOWN.has(this.ext().toLowerCase())) this.markdown = value;
-        // writeTextFile writes only on this computer, and a truncated preview must never be saved.
-        if (!on && value === text) this.original = text;
+        // A truncated preview must never be saved. Another machine saves through sh arguments (writeRemoteText):
+        // not on Windows machines without sh, and only up to REMOTE_SAVE_BYTES.
+        if (value === text && (!on || (shells.get(on) !== "ps" && utf8Length(text) <= REMOTE_SAVE_BYTES))) this.original = text;
         this.plain = value.length > PLAIN_CHARS;
         this.code = this.editor(value, this.original === null);
       } catch { if (this.file === path && this.current(context)) this.fileError = "Cannot preview this file (binary, too large, or unreadable)"; }
@@ -607,11 +647,16 @@ export default class Files extends View {
   // Writes only if the file still holds what was read: a change made elsewhere is never overwritten.
   save(cx) {
     if (!this.dirty || this.saving) return;
-    const path = this.file, state = this.code, text = state.value();
+    const path = this.file, state = this.code, text = state.value(), on = this.on;
+    if (on && utf8Length(text) > REMOTE_SAVE_BYTES) {
+      this.saveError = `Too large to save on another machine (limit ${byteSize(REMOTE_SAVE_BYTES)})`;
+      return cx.notify();
+    }
     this.saving = true; this.saveError = null;
     cx.spawn(async cx => {
       try {
-        await writeTextFile(`${this.root}/${path}`, text, this.original);
+        const target = `${this.root}/${path}`;
+        await (on ? writeRemoteText(target, text, this.original, on) : writeTextFile(target, text, this.original));
         if (this.code !== state) return;
         this.original = text;
         this.dirty = state.value() !== text;
