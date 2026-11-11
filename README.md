@@ -1,8 +1,8 @@
 # oh-my-herdr
 
-File name and content search, Markdown previews, file editing and image
-previews for the [Herdr](https://herdr.dev) desktop app's Files panel, on
-Windows, macOS, Linux and remote machines.
+File name and content search, Markdown previews, file editing, image previews,
+renaming and drag and drop for the [Herdr](https://herdr.dev) desktop app's
+Files panel, on Windows, macOS, Linux and remote machines.
 
 ## Contents
 
@@ -10,7 +10,10 @@ Windows, macOS, Linux and remote machines.
   **Content**), backed by ripgrep, an editor for this computer's files, and
   a live Markdown preview beside the text. Images (PNG, JPEG, GIF, WebP, BMP,
   SVG and more) open in a dialog sized to the picture, scrolling when it is
-  larger than the window.
+  larger than the window. Right-click a file or folder to rename it, or select
+  it and press Enter. Drag a row onto a folder (or the empty space below the
+  rows) to move it there; drop files from Finder or Explorer onto a folder to
+  copy them in. Nothing is ever overwritten.
 - `layouts/main-search.json`: Herdr's `main` layout using `files-search` for
   the Files panel.
 - Other `mods/` and `layouts/`: Herdr 0.1.13's built-in mods and layouts, for

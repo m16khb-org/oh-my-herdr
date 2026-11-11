@@ -3,7 +3,7 @@
 // streams ripgrep results while it runs. Images open in a dialog: this same mod, opened as an overlay.
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, TextView, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window, appHome, openOverlay, closeOverlay, props } from "herdr";
+import { spaces, panes, focused, exec, hc, readTextFile, writeTextFile, watchFolder, theme, settings, window, appHome, openOverlay, closeOverlay, props } from "herdr";
 import * as fs from "fs/promises";
 import { Buffer } from "buffer";
 import { createHash } from "crypto";
@@ -15,6 +15,12 @@ function location() {
   return { cwd: pane?.cwd || f?.cwd || space?.folder, on, space: space?.id };
 }
 const key = () => JSON.stringify(location());
+// The focused terminal, as hc addresses it (machine/t7 on another machine): files dropped for that machine travel beside it.
+function focusedTerminal(on) {
+  const f = focused(), pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
+  const terminal = pane?.terminal ?? f?.terminal ?? null;
+  return terminal && on && !terminal.includes("/") ? `${on}/${terminal}` : terminal;
+}
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
 const MARKDOWN = new Set(["md", "markdown", "mdown", "mkd"]);
 const PREVIEW_CHARS = 400000;
@@ -129,6 +135,32 @@ function imageSize(b) {
   return null;
 }
 
+// Moving (rename, drag within the tree) and copying (files dropped from Finder or Explorer) never replace what is
+// already there: they answer "exists" instead. A rename that only changes letter case names the same file on macOS
+// and Windows, so it is allowed through, by way of a temporary name on Windows.
+const MOVE_SH = 'if { [ -e "$2" ] || [ -L "$2" ]; } && ! [ "$1" -ef "$2" ]; then echo exists; exit 0; fi; mv -- "$1" "$2"';
+const MOVE_PS = "param($a, $b) $i = Get-Item -LiteralPath $a -Force -ErrorAction Stop; if (Test-Path -LiteralPath $b) { if ((Get-Item -LiteralPath $b -Force).FullName -ne $i.FullName) { 'exists'; return }; $t = $b + '.renaming'; Move-Item -LiteralPath $a -Destination $t -ErrorAction Stop; Move-Item -LiteralPath $t -Destination $b -ErrorAction Stop; return }; Move-Item -LiteralPath $a -Destination $b -ErrorAction Stop";
+const COPY_SH = 'if [ -e "$2" ] || [ -L "$2" ]; then echo exists; exit 0; fi; cp -R -- "$1" "$2"';
+const COPY_PS = "param($a, $b) if (Test-Path -LiteralPath $b) { 'exists'; return }; Copy-Item -LiteralPath $a -Destination $b -Recurse -ErrorAction Stop";
+const baseName = path => path.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+const parentOf = path => path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+const joinPath = (folder, name) => folder ? `${folder}/${name}` : name;
+const inside = (path, folder) => path === folder || path.startsWith(folder + "/");
+
+async function fileOp(on, sh, ps, from, to) {
+  const r = await shell(on, sh, ps, [from, to]);
+  if (r.stdout.trim() === "exists") throw new Error(`${baseName(to)} already exists there`);
+  if (r.code !== 0) throw new Error(r.stderr.trim().split("\n")[0] || "The file operation failed");
+}
+
+// A file name the machine accepts: not empty, no folder separator, and on Windows none of its reserved characters.
+function badName(name, windows) {
+  if (!name.trim()) return "Enter a name";
+  if (name === "." || name === "..") return "That name is reserved";
+  if (name.includes("/") || (windows && /[\\:*?"<>|]/.test(name))) return windows ? 'A name can\'t contain \\ / : * ? " < > |' : "A name can't contain /";
+  return null;
+}
+
 const COMMON = ["--hidden", "--glob", "!.git", "--path-separator", "/"];
 const rgArgs = (mode, query) => mode === "name"
   ? ["--files", ...COMMON, "."]
@@ -198,6 +230,9 @@ export default class Files extends View {
     this.saved = new Map();
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {}; this.hitRows = []; this.headers = new Map(); this.count = 0;
     this.mode = "content";
+    // The tree takes the keyboard when a row is clicked, so Enter renames the selected row (F2 too, when
+    // Herdr's own F2, Rename tab, is unbound).
+    this.focus = cx.focus_handle(); this.selected = null; this.renaming = null; this.menu = null; this.drag = null;
     this.query = InputState.new({ placeholder: "Search files" });
     this.query.on("change", (_e, cx) => { this.debounce?.cancel(); this.debounce = cx.timer.after(200, cx => this.search(cx)); });
     this.query.on("focus", (_e, cx) => { this.queryFocused = true; cx.notify(); });
@@ -233,6 +268,7 @@ export default class Files extends View {
     // Unsaved edits keep the panel on their file until they're saved or discarded.
     if (this.dirty) return;
     const { cwd, on } = location(), next = key();
+    this.terminal = focusedTerminal(on);
     if (next !== this.context?.key) {
       if (this.context) this.saved.set(this.context.key, { folders: this.folders, file: this.file });
       const saved = this.saved.get(next);
@@ -265,8 +301,173 @@ export default class Files extends View {
         if (!this.current(context)) return;
         this.marks = marks; this.error = null; this.watch(cwd, cx);
       } catch (e) { if (this.current(context)) this.error = String(e); }
-      finally { if (this.context === context) this.loading = false; cx.notify(); }
+      finally {
+        if (this.context === context) this.loading = false;
+        if (this.stale) { this.stale = false; this.refresh(cx); }
+        cx.notify();
+      }
     });
+  }
+
+  // After a file operation: read the tree again now, or as soon as the read in progress ends.
+  reload(cx) {
+    if (this.loading) this.stale = true; else this.refresh(cx);
+  }
+
+  isWindows() {
+    return this.on ? shells.get(this.on) === "ps" : window()?.platform === "windows";
+  }
+
+  // Paths under a moved or renamed entry follow it: open folders, the open file and the selection.
+  moved(from, to) {
+    const follow = path => inside(path, from) ? to + path.slice(from.length) : path;
+    this.folders = new Set([...this.folders].map(follow));
+    this.entries = new Map([...this.entries].map(([path, entries]) => [path && follow(path), entries]));
+    if (this.file) this.file = follow(this.file);
+    if (this.selected) this.selected = follow(this.selected);
+  }
+
+  async moveEntry(from, to, cx) {
+    const root = this.root;
+    await fileOp(this.on, MOVE_SH, MOVE_PS, `${root}/${from}`, `${root}/${to}`);
+    if (this.root !== root) return;
+    this.moved(from, to);
+    this.reload(cx);
+  }
+
+  startRename(path, cx) {
+    if (this.renaming) return;
+    const name = baseName(path), dot = name.lastIndexOf(".");
+    const state = InputState.new({ value: name });
+    const rename = this.renaming = { path, state, error: null };
+    let done = false;
+    const finish = (commit, cx) => {
+      if (done || this.renaming !== rename) return;
+      const next = state.value().trim();
+      if (!commit || next === name) { done = true; this.renaming = null; state.release(); this.focus.focus(); cx.notify(); return; }
+      const bad = badName(next, this.isWindows());
+      if (bad) { rename.error = bad; this.note = { text: bad, error: true }; cx.notify(); return; }
+      done = true;
+      cx.spawn(async cx => {
+        try { await this.moveEntry(path, joinPath(parentOf(path), next), cx); this.note = null; }
+        catch (e) { this.note = { text: String(e?.message ?? e), error: true }; }
+        finally { if (this.renaming === rename) this.renaming = null; state.release(); this.focus.focus(); cx.notify(); }
+      });
+    };
+    rename.finish = finish;
+    state.on("submit", (_e, cx) => finish(true, cx));
+    state.on("change", (_e, cx) => { if (rename.error) { rename.error = null; this.note = null; cx.notify(); } });
+    // Clicking elsewhere keeps the new name, as Finder and Explorer do.
+    state.on("blur", (_e, cx) => finish(true, cx));
+    state.focus();
+    // The name is selected without its extension, so typing replaces just the name.
+    state.set_selected_range({ start: 0, end: dot > 0 ? dot : name.length });
+    this.menu = null;
+    cx.notify();
+  }
+
+  // Files dropped from Finder or Explorer are copied into the folder under the pointer. On another machine they
+  // travel beside its focused terminal first (hc put), then move into place; folders can't travel that way.
+  dropFiles(paths, folder, cx) {
+    const root = this.root, on = this.on, terminal = this.terminal;
+    if (!root || !paths?.length) return;
+    this.note = { text: `Copying ${paths.length === 1 ? baseName(paths[0]) : `${paths.length} items`}…` };
+    cx.notify();
+    cx.spawn(async cx => {
+      const failed = [];
+      for (const path of paths) {
+        const target = `${root}/${joinPath(folder, baseName(path))}`;
+        try {
+          if (!on) { await fileOp(null, COPY_SH, COPY_PS, path, target); continue; }
+          if (!terminal) throw new Error("open a terminal on that machine first");
+          const put = await hc(["put", terminal, path, "--json"]);
+          if (put.code !== 0) throw new Error(put.stderr.trim().split("\n")[0] || "cannot send it there (folders can't be sent)");
+          let landed = put.stdout.trim();
+          try { const j = JSON.parse(landed); landed = typeof j === "string" ? j : j.path ?? j.file ?? landed; } catch { /* plain text */ }
+          await fileOp(on, MOVE_SH, MOVE_PS, landed, target);
+        } catch (e) {
+          const why = String(e?.message ?? e), name = baseName(path);
+          failed.push(why.startsWith(name) ? why : `${name}: ${why}`);
+        }
+      }
+      if (this.root === root) {
+        this.note = failed.length ? { text: failed.join(" · "), error: true } : null;
+        if (folder && !this.folders.has(folder)) this.toggle(folder, cx);
+        this.reload(cx);
+      }
+      cx.notify();
+    });
+  }
+
+  // A drag inside the tree moves the entry into the folder it is released over; a file row means its folder,
+  // and the empty space below the rows means the top folder.
+  dragTarget(path, dir) {
+    return dir ? path : parentOf(path);
+  }
+
+  canDrop(target) {
+    const from = this.drag?.path;
+    return from != null && !inside(target, from) && parentOf(from) !== target;
+  }
+
+  // A press becomes a drag once the pointer has moved a few pixels with the button held.
+  dragMove(e, target, cx) {
+    const drag = this.drag;
+    if (!drag) return;
+    if (!drag.active && Math.hypot(e.position.x - drag.x, e.position.y - drag.y) > 5) { drag.active = true; this.menu = null; cx.notify(); }
+    if (drag.active && this.dropTarget !== target) { this.dropTarget = target; cx.notify(); }
+  }
+
+  drop(target, cx) {
+    const drag = this.drag, ok = drag?.active && this.canDrop(target);
+    this.drag = null; this.dropTarget = null;
+    if (!ok) { cx.notify(); return; }
+    cx.spawn(async cx => {
+      try {
+        await this.moveEntry(drag.path, joinPath(target, baseName(drag.path)), cx);
+        this.note = null;
+        if (target && !this.folders.has(target)) this.toggle(target, cx);
+      } catch (e) { this.note = { text: String(e?.message ?? e), error: true }; }
+      finally { cx.notify(); }
+    });
+  }
+
+  cancelDrag(cx) {
+    if (!this.drag) return;
+    const active = this.drag.active;
+    this.drag = null; this.dropTarget = null;
+    if (active) cx.notify();
+  }
+
+  // The row names the entry; the panel, which hears the same press next, places the menu where it was.
+  openMenu(path, dir, cx) {
+    this.selected = path; this.focus.focus();
+    this.menu = { path, dir, x: 0, y: 0, placed: false };
+    cx.notify();
+  }
+
+  placeMenu(e, cx) {
+    const m = this.menu, at = e.local_position, box = e.bounds;
+    if (!m || m.placed || !at) return;
+    // Kept inside the panel: the menu is about 100 px tall and 210 wide.
+    m.x = box ? Math.min(at.x, box.width - 216) : at.x;
+    m.y = box ? Math.min(at.y, box.height - 106) : at.y;
+    m.placed = true;
+    cx.notify();
+  }
+
+  menuView(t) {
+    const m = this.menu, full = `${this.root}/${m.path}`;
+    if (!m.placed) return div();
+    const item = (id, label, hint, act) => h_flex().id(`files-menu-${id}`).h(28).px(10).gap(12).items_center().rounded(6).cursor_pointer()
+      .hover(s => s.bg(t.hover)).on_click((_e, cx) => { this.menu = null; act(cx); cx.notify(); })
+      .child(div().flex_1().child(label)).when(Boolean(hint), el => el.child(div().text_size(11).text_color(t.dim).child(hint)));
+    return v_flex().id("files-menu").absolute().left(Math.max(4, m.x)).top(m.y).w(210).p(4).rounded(8)
+      .bg(t.background).border_1().border_color(t.border).shadow_lg().text_size(12)
+      .on_mouse_down_out((_e, cx) => { this.menu = null; cx.notify(); })
+      .child(item("rename", "Rename", "Enter", cx => this.startRename(m.path, cx)))
+      .child(item("copy", "Copy path", "", cx => cx.write_to_clipboard(full)))
+      .child(item("copy-rel", "Copy relative path", "", cx => cx.write_to_clipboard(m.path)));
   }
 
   toggle(path, cx) {
@@ -455,11 +656,33 @@ export default class Files extends View {
     for (const entry of this.entries.get(prefix) ?? []) {
       if (out.length >= TOTAL) break;
       const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
+      const renaming = this.renaming?.path === path ? this.renaming : null, target = this.dragTarget(path, entry.dir);
+      const dragging = this.drag?.active, dropping = dragging && entry.dir && this.dropTarget === path && this.canDrop(path);
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
-        .on_click((_e, cx) => entry.dir ? this.toggle(path, cx) : this.show(path, cx))
+        .when(this.selected === path || dropping, el => el.bg(t.selected)).when(dropping, el => el.border_1().border_color(t.accent))
+        .when(dragging && this.drag.path === path, el => el.opacity(0.5))
+        // The menu doesn't hide the rows under it from the pointer: a press while it is open belongs to the menu.
+        .on_mouse_down("left", (e, _cx) => {
+          this.pressedOverMenu = Boolean(this.menu); this.dragged = false;
+          if (!renaming && !this.menu) this.drag = { path, x: e.position.x, y: e.position.y, active: false };
+        })
+        // Stopped here so the tree under the rows doesn't take the target back to the top folder.
+        .on_mouse_move((e, cx) => { if (this.drag) { cx.stop_propagation(); this.dragMove(e, target, cx); } })
+        .on_mouse_up("left", (_e, cx) => { if (this.drag?.active) { cx.stop_propagation(); this.dragged = true; this.drop(target, cx); } })
+        .on_drop((e, cx) => { cx.stop_propagation(); this.dropFiles(e.paths, target, cx); })
+        .on_mouse_down("right", (_e, cx) => { if (!renaming) this.openMenu(path, entry.dir, cx); })
+        .on_click((_e, cx) => {
+          if (renaming || this.pressedOverMenu || this.dragged) { this.pressedOverMenu = false; this.dragged = false; return; }
+          this.selected = path; this.focus.focus();
+          entry.dir ? this.toggle(path, cx) : this.show(path, cx);
+        })
         .child(entry.dir ? svg(`mods/files-search/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
         .child(svg(`mods/files-search/${entry.dir ? "folder" : "file"}.svg`).size(14).flex_none().text_color(t.muted))
-        .child(div().flex_1().min_w(0).truncate().child(entry.name))
+        .child(renaming
+          ? v_flex().flex_1().min_w(0)
+            .on_key_down((e, cx) => { if (e.key === "escape") { cx.stop_propagation(); renaming.finish(false, cx); } })
+            .child(Input.new(renaming.state).h(22).px(6).items_center().rounded(5).border(1).border_color(renaming.error ? t.ansi1 : t.accent).bg(t.background).text_color(t.foreground))
+          : div().flex_1().min_w(0).truncate().child(entry.name))
         .when(Boolean(mark), el => el.child(div().text_size(11).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark))));
       if (entry.dir && open) this.rows(path, depth + 1, out, t);
     }
@@ -629,7 +852,11 @@ export default class Files extends View {
     // Measured while drawing, the only time a view may ask; the image dialog is sized from it.
     try { this.viewport = globalThis.window?.viewport_size?.() ?? this.viewport; } catch { /* not this host */ }
     const t = theme();
-    return v_flex().id("files").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
+    return v_flex().id("files").relative().size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
+      .on_mouse_down("right", (e, cx) => this.placeMenu(e, cx))
+      // A drag ends when the button comes up outside the rows, or when the pointer leaves the panel.
+      .on_mouse_up("left", (_e, cx) => this.cancelDrag(cx))
+      .on_hover((hovered, cx) => { if (!hovered) this.cancelDrag(cx); })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         // Unsaved edits hold the panel on their file: Save or Discard leaves it.
         .when(Boolean(this.file) && !this.dirty, el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.show(null); cx.notify(); }).child("←")))
@@ -657,9 +884,17 @@ export default class Files extends View {
               .size_full().on_item_click((key, cx) => this.show(key.slice(key.indexOf("\0") + 1), cx)))
             .child(Scrollbar.vertical("files-search").viewport_from_layout().absolute().inset_0()));
       })
-      .when(!this.file && !this.query.value(), el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
+      .when(!this.file && !this.query.value(), el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6)
+        .track_focus(this.focus)
+        .on_key_down((e, cx) => { if ((e.key === "f2" || e.key === "enter") && this.selected && !this.renaming) { cx.stop_propagation(); this.startRename(this.selected, cx); } else if (e.key === "escape" && this.menu) { this.menu = null; cx.notify(); } })
+        .on_mouse_move((e, cx) => this.dragMove(e, "", cx))
+        .on_mouse_up("left", (_e, cx) => { if (this.drag?.active) { cx.stop_propagation(); this.dragged = true; this.drop("", cx); } })
+        .on_drop((e, cx) => this.dropFiles(e.paths, "", cx))
+        .when(Boolean(this.drag?.active) && this.dropTarget === "" && this.canDrop(""), el => el.border_1().border_color(t.accent))
+        .children(this.rows("", 0, [], t))
         .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
         .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
-      .when(Boolean(this.file), el => el.child(this.fileBody(t)));
+      .when(Boolean(this.file), el => el.child(this.fileBody(t)))
+      .when(Boolean(this.menu), el => el.child(this.menuView(t)));
   }
 }
