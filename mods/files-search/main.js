@@ -624,7 +624,7 @@ export default class Files extends View {
         // A vector has no pixels of its own: a small one (an icon) is drawn at least 480 px across.
         const shown = size && (vector ? size.map(n => n * Math.max(1, 480 / Math.max(...size))) : size);
         const dialog = this.imageDialogSize(shown);
-        openOverlay({ mod: "files-search", kind: "dialog", ...dialog, props: { image: { src, path, size: shown, facts, width: dialog.width } } });
+        openOverlay({ mod: "files-search", kind: "dialog", width: dialog.width, height: dialog.height, props: { image: { src, path, size: shown, facts, width: dialog.inner } } });
         this.note = null;
       } catch (e) {
         if (this.opening === opening && this.current(context)) this.note = { text: String(e?.message ?? e), error: true };
@@ -633,15 +633,18 @@ export default class Files extends View {
   }
 
   // The dialog wraps the picture: header, padding and border around it, at least wide enough for the
-  // header and at most most of the window. A larger picture keeps its size and scrolls inside.
+  // header and at most 90% by 88% of the Herdr window. A larger picture keeps its size and scrolls inside.
+  // An overlay's px are drawn at the person's zoom while viewport_size measures the screen, so px sized from
+  // the viewport ran past the window's edge at zoom 1.2. The size is given as a share of the window instead
+  // (a number up to 1), which no zoom or display scale can push past it. inner: its width in the dialog's px.
   imageDialogSize(size) {
     const view = this.viewport;
-    if (!size || !view) return { width: 0.6, height: 0.6 };
-    const clamp = (n, low, high) => Math.round(Math.min(Math.max(n, low), high));
-    return {
-      width: clamp(size[0] + IMAGE_PAD * 2 + 2, 360, view.width * 0.9),
-      height: clamp(size[1] + IMAGE_PAD * 2 + IMAGE_HEADER + 2, 160, view.height * 0.88),
-    };
+    if (!size || !view?.width || !view?.height) return { width: 0.6, height: 0.6, inner: 0 };
+    const zoom = Number(settings()?.zoom) || 1;
+    const share = (px, low, of, most) => Math.min(Math.max(px, low) * zoom / of, most);
+    const width = share(size[0] + IMAGE_PAD * 2 + 2, 360, view.width, 0.9);
+    const height = share(size[1] + IMAGE_PAD * 2 + IMAGE_HEADER + 2, 160, view.height, 0.88);
+    return { width, height, inner: width * view.width / zoom };
   }
 
   imageView() {
