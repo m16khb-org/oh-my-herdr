@@ -1,9 +1,12 @@
 // A lazy file browser for the focused pane's folder, with bounded previews (Markdown rendered, with its
 // source a click away), editing for this computer's files, and a search by file name or by content that
-// streams ripgrep results while it runs.
-import { View, div, svg } from "gpui-kit";
+// streams ripgrep results while it runs. Images open in a dialog: this same mod, opened as an overlay.
+import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState, Input, InputState, Scrollbar, TextView, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window, appHome, openOverlay, closeOverlay, props } from "herdr";
+import * as fs from "fs/promises";
+import { Buffer } from "buffer";
+import { createHash } from "crypto";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
@@ -26,6 +29,105 @@ const START = '{ set -m; } 2>/dev/null; command -v rg >/dev/null 2>&1 || { echo 
 // "done" first when rg has exited, then at most CHUNK bytes from byte offset $3: tail -c seeks instead of rescanning the file.
 const POLL = 'kill -0 "$2" 2>/dev/null || echo done; tail -c +"$3" "$1" | head -c "$4"';
 const STOP = 'kill "$2" 2>/dev/null; rm -f "$1"';
+
+// image() draws only files under the app folder, so a picture is copied into this mod's cache first.
+const IMAGES = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff", "svg"]);
+const IMAGE_DIR = "mods/files-search/.cache", IMAGE_CACHE = 24, IMAGE_HEADER = 40, IMAGE_PAD = 16;
+// exec answers at most 8 MiB and base64 grows a file by a third; fs reads this computer's home folder directly.
+const EXEC_IMAGE_BYTES = 6 << 20, IMAGE_BYTES = 64 << 20;
+const IMAGE_SH = 'f=$1; [ -f "$f" ] || { echo missing; exit 0; }; n=$(wc -c < "$f" | tr -d " ") || exit 1; if [ "$n" -gt "$2" ]; then echo "big $n"; exit 0; fi; echo "ok $n"; if command -v base64 >/dev/null 2>&1; then base64 < "$f"; else openssl base64 < "$f"; fi';
+const IMAGE_PS = "param($p, $m) $i = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue; if (-not $i -or $i.PSIsContainer) { 'missing' } elseif ($i.Length -gt [long]$m) { 'big ' + $i.Length } else { 'ok ' + $i.Length; [Convert]::ToBase64String([IO.File]::ReadAllBytes($i.FullName)) }";
+const megabytes = n => `${(n / (1 << 20)).toFixed(1)} MB`;
+const byteSize = n => n < 1024 ? `${n} B` : n < 1 << 20 ? `${Math.round(n / 1024)} KB` : megabytes(n);
+const isImage = path => IMAGES.has(path.slice(path.lastIndexOf(".") + 1).toLowerCase()) && path.includes(".");
+
+// PowerShell reads curly single quotes as quotes too, so they're doubled like '.
+const quotePs = text => "'" + text.replace(/['‘’‚‛]/g, "$&$&") + "'";
+// Each machine answers in sh, or in PowerShell when it is Windows (this one, or another without sh).
+const shells = new Map();
+async function shell(on, sh, ps, args) {
+  const kind = shells.get(on ?? "") ?? (!on && window()?.platform === "windows" ? "ps" : "sh");
+  if (kind === "sh") {
+    try { return await exec("sh", ["-c", sh, "files", ...args], { on }); }
+    catch (e) {
+      if (!on || !String(e).includes("cannot start sh: program not found")) throw e;
+      shells.set(on, "ps");
+    }
+  }
+  // Windows PowerShell otherwise uses the console code page; exec decodes UTF-8.
+  return exec("powershell", ["-NoProfile", "-Command", `[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & { ${ps} } ${args.map(quotePs).join(" ")}`], { on });
+}
+
+// Reads a picture here or on another machine: Unix machines answer with base64 through sh, Windows through PowerShell.
+async function imageBytes(path, on) {
+  if (!on) {
+    let bytes = null;
+    try { bytes = await fs.readFile(path); } catch { /* outside the home folder: ask a shell */ }
+    if (bytes) {
+      if (bytes.length > IMAGE_BYTES) throw new Error(`Image too large to preview (${megabytes(bytes.length)}, limit ${megabytes(IMAGE_BYTES)})`);
+      return bytes;
+    }
+  }
+  const r = await shell(on, IMAGE_SH, IMAGE_PS, [path, String(EXEC_IMAGE_BYTES)]);
+  if (r.code !== 0) throw new Error(r.stderr.trim().split("\n")[0] || "Cannot read this image");
+  const out = r.stdout, nl = out.indexOf("\n"), head = (nl < 0 ? out : out.slice(0, nl)).trim();
+  if (head === "missing") throw new Error("This file is no longer available");
+  if (head.startsWith("big ")) throw new Error(`Image too large to preview (${megabytes(Number(head.slice(4)))}, limit ${megabytes(EXEC_IMAGE_BYTES)})`);
+  if (!head.startsWith("ok ") || nl < 0) throw new Error("Cannot read this image");
+  return Buffer.from(out.slice(nl + 1).replace(/\s+/g, ""), "base64");
+}
+
+// Named by content, so a changed picture is a new file and an unchanged one is written once.
+let cached = [];
+async function cacheImage(bytes, ext) {
+  const name = `${createHash("sha1").update(bytes).digest("hex").slice(0, 20)}.${ext.toLowerCase()}`;
+  const dir = `${appHome()}/${IMAGE_DIR}`;
+  await fs.mkdir(dir, { recursive: true });
+  if (!(await fs.exists(`${dir}/${name}`))) await fs.writeFile(`${dir}/${name}`, bytes);
+  cached = [name, ...cached.filter(n => n !== name)].slice(0, IMAGE_CACHE);
+  const files = await fs.readdir(dir).catch(() => []);
+  if (files.length > IMAGE_CACHE) for (const f of files) if (!cached.includes(f)) await fs.unlink(`${dir}/${f}`).catch(() => null);
+  return `${IMAGE_DIR}/${name}`;
+}
+
+// An SVG's own size, from width and height in px or else its viewBox; null when it states neither.
+function svgSize(b) {
+  const tag = Buffer.from(b.subarray(0, 4096)).toString("utf8").match(/<svg\b[^>]*>/i)?.[0];
+  if (!tag) return null;
+  const attr = name => tag.match(new RegExp(`\\s${name}\\s*=\\s*["']([^"']*)["']`, "i"))?.[1];
+  const px = v => /^\s*[\d.]+\s*(px)?\s*$/.test(v ?? "") ? parseFloat(v) : NaN;
+  const w = px(attr("width")), h = px(attr("height"));
+  if (w > 0 && h > 0) return [w, h];
+  const box = attr("viewBox")?.trim().split(/[\s,]+/).map(Number);
+  return box?.length === 4 && box[2] > 0 && box[3] > 0 ? [box[2], box[3]] : null;
+}
+
+// Pixel size from the header, for the formats that keep it near the start; null for the rest (TIFF, ICO).
+function imageSize(b) {
+  const u16 = (i, le) => le ? b[i] | b[i + 1] << 8 : b[i] << 8 | b[i + 1];
+  const u32 = (i, le) => (le ? b[i] | b[i + 1] << 8 | b[i + 2] << 16 | b[i + 3] << 24 : b[i] << 24 | b[i + 1] << 16 | b[i + 2] << 8 | b[i + 3]) >>> 0;
+  const ascii = (i, n) => String.fromCharCode(...b.subarray(i, i + n));
+  if (b.length >= 24 && ascii(1, 3) === "PNG") return [u32(16), u32(20)];
+  if (b.length >= 10 && ascii(0, 3) === "GIF") return [u16(6, true), u16(8, true)];
+  if (b.length >= 26 && ascii(0, 2) === "BM") return [u32(18, true), Math.abs(u32(22, true) | 0)];
+  if (b.length >= 30 && ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") {
+    const kind = ascii(12, 4);
+    if (kind === "VP8X") return [1 + (b[24] | b[25] << 8 | b[26] << 16), 1 + (b[27] | b[28] << 8 | b[29] << 16)];
+    if (kind === "VP8 ") return [u16(26, true) & 0x3fff, u16(28, true) & 0x3fff];
+    if (kind === "VP8L") { const bits = u32(21, true); return [(bits & 0x3fff) + 1, ((bits >>> 14) & 0x3fff) + 1]; }
+  }
+  if (b[0] === 0xff && b[1] === 0xd8) {
+    for (let i = 2; i + 9 < b.length;) {
+      if (b[i] !== 0xff) { i++; continue; }
+      const m = b[i + 1];
+      if (m === 0xff) { i++; continue; }
+      if (m === 0x01 || (m >= 0xd0 && m <= 0xd8)) { i += 2; continue; }
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return [u16(i + 7), u16(i + 5)];
+      i += 2 + u16(i + 2);
+    }
+  }
+  return null;
+}
 
 const COMMON = ["--hidden", "--glob", "!.git", "--path-separator", "/"];
 const rgArgs = (mode, query) => mode === "name"
@@ -90,6 +192,9 @@ async function directory(path, on) {
 
 export default class Files extends View {
   init(_props, cx) {
+    // The image dialog is another copy of this mod, given the cached picture to draw.
+    this.viewer = props()?.image ?? null;
+    if (this.viewer) return;
     this.saved = new Map();
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {}; this.hitRows = []; this.headers = new Map(); this.count = 0;
     this.mode = "content";
@@ -185,8 +290,68 @@ export default class Files extends View {
     cx.notify();
   }
 
+  // Copies the picture into the cache and opens it in a dialog; the panel stays where it was.
+  openImage(path, cx) {
+    const context = this.context, root = this.root, on = this.on, name = path.slice(path.lastIndexOf("/") + 1);
+    const opening = this.opening = { path };
+    this.note = { text: `Opening ${name}…` };
+    cx.notify();
+    cx.spawn(async cx => {
+      try {
+        const bytes = await imageBytes(`${root}/${path}`, on);
+        const src = await cacheImage(bytes, path.slice(path.lastIndexOf(".") + 1));
+        if (this.opening !== opening || !this.current(context)) return;
+        const vector = /\.svg$/i.test(path), size = vector ? svgSize(bytes) : imageSize(bytes), facts = [size && `${size[0]} × ${size[1]}`, byteSize(bytes.length)].filter(Boolean).join(" · ");
+        // A vector has no pixels of its own: a small one (an icon) is drawn at least 480 px across.
+        const shown = size && (vector ? size.map(n => n * Math.max(1, 480 / Math.max(...size))) : size);
+        const dialog = this.imageDialogSize(shown);
+        openOverlay({ mod: "files-search", kind: "dialog", ...dialog, props: { image: { src, path, size: shown, facts, width: dialog.width } } });
+        this.note = null;
+      } catch (e) {
+        if (this.opening === opening && this.current(context)) this.note = { text: String(e?.message ?? e), error: true };
+      } finally { if (this.opening === opening) this.opening = null; cx.notify(); }
+    });
+  }
+
+  // The dialog wraps the picture: header, padding and border around it, at least wide enough for the
+  // header and at most most of the window. A larger picture keeps its size and scrolls inside.
+  imageDialogSize(size) {
+    const view = this.viewport;
+    if (!size || !view) return { width: 0.6, height: 0.6 };
+    const clamp = (n, low, high) => Math.round(Math.min(Math.max(n, low), high));
+    return {
+      width: clamp(size[0] + IMAGE_PAD * 2 + 2, 360, view.width * 0.9),
+      height: clamp(size[1] + IMAGE_PAD * 2 + IMAGE_HEADER + 2, 160, view.height * 0.88),
+    };
+  }
+
+  imageView() {
+    const t = theme(), v = this.viewer;
+    // Shown at its own size and scrolled when larger than the dialog. Without a known size (TIFF, ICO,
+    // an SVG with relative dimensions) it fits the dialog instead.
+    const body = v.size
+      // One scroller per axis: GPUI's two-axis overflow_scrollbar didn't scroll inside a dialog.
+      ? v_flex().id("files-image-scroll").flex_1().min_h(0).overflow_y_scrollbar()
+        .child(div().id("files-image-scroll-x").flex_none().w_full().overflow_x_scrollbar()
+          // Centered only while it fits: a centered picture wider than the dialog would hang off the left edge.
+          .child(h_flex().min_w_full().p(IMAGE_PAD).when(v.size[0] + IMAGE_PAD * 2 + 2 <= v.width, el => el.justify_center())
+            .child(image(v.src).flex_none().w(v.size[0]).h(v.size[1]))))
+      : div().flex_1().min_h(0).relative()
+        .child(div().absolute().inset_0().p(IMAGE_PAD).flex().items_center().justify_center().child(image(v.src).size_full()));
+    return v_flex().id("files-image").size_full().min_h(0).overflow_hidden().bg(t.background).text_color(t.foreground).text_size(13)
+      .child(h_flex().h(IMAGE_HEADER).flex_none().pl(14).pr(8).gap(10).items_center().border_b(1).border_color(t.border)
+        .child(div().flex_none().font_semibold().child(v.path.slice(v.path.lastIndexOf("/") + 1)))
+        .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.dim).child(v.path.slice(0, Math.max(v.path.lastIndexOf("/"), 0))))
+        .child(div().flex_none().text_size(12).text_color(t.dim).child(v.facts))
+        .child(div().id("files-image-close").flex_none().w(26).h(26).flex().items_center().justify_center().rounded(6).cursor_pointer()
+          .text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground))
+          .on_click(() => closeOverlay(props().overlay)).child("✕")))
+      .child(body);
+  }
+
   show(path, cx) {
-    this.code?.release(); this.code = null; this.markdown = null; this.file = path; this.fileError = null; this.plain = false;
+    if (path && cx && isImage(path)) return this.openImage(path, cx);
+    this.code?.release(); this.code = null; this.markdown = null; this.file = path; this.fileError = null; this.plain = false; this.note = null;
     this.original = null; this.dirty = false; this.saving = false; this.saveError = null; this.renderMd?.cancel();
     if (!path || !cx) return;
     const context = this.context, root = this.root, on = this.on;
@@ -459,7 +624,10 @@ export default class Files extends View {
   }
 
   render(cx) {
+    if (this.viewer) return this.imageView();
     if (key() !== this.context?.key) this.refresh(cx);
+    // Measured while drawing, the only time a view may ask; the image dialog is sized from it.
+    try { this.viewport = globalThis.window?.viewport_size?.() ?? this.viewport; } catch { /* not this host */ }
     const t = theme();
     return v_flex().id("files").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
@@ -474,6 +642,7 @@ export default class Files extends View {
         // Discard reads the file again, so a file changed elsewhere shows its new text.
         .when(this.dirty, el => el.child(this.headerButton("files-discard", "Discard", t, cx => this.show(this.file, cx), t.ansi1))
           .child(this.headerButton("files-save", this.saving ? "Saving…" : "Save", t, cx => this.save(cx), t.accent))))
+      .when(Boolean(this.note), el => el.child(div().flex_none().px(14).py(6).text_size(11).text_color(this.note.error ? t.ansi1 : t.dim).border_b(1).border_color(t.border).child(this.note.text)))
       .when(Boolean(this.saveError), el => el.child(div().flex_none().px(14).py(6).text_size(11).text_color(t.ansi1).border_b(1).border_color(t.border).child(this.saveError)))
       .when(!this.file, el => el.child(h_flex().flex_none().px(8).pt(8).pb(4).gap(6).items_center()
         .child(Input.new(this.query).flex_1().min_w(0).h(30).px(10).items_center().rounded(6).border(1).border_color(this.queryFocused ? t.accent : t.input).bg(t.background).text_color(t.foreground))
